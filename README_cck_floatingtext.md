@@ -31,10 +31,12 @@ Il script crea automaticamente un figlio `FloatingTextTMP` con il componente
   del font (TMP auto-size).
 - `targetWidth` → se > 0, scala il testo in modo che non superi questa larghezza
   (utile per testo lungo).
-- `billboardToCamera` / `billboardToNearestUser` → se true, il testo ruota per
-  fronteggiare la camera; se `billboardToNearestUser` sceglie la camera
-  dell'utente più vicino (multiplayer).
+- `billboardToCamera` / `billboardToNearestUser` → il testo fronteggia la camera;
+  la scansione nearest-camera è cachata (`cameraRescanInterval`, default 0.5s).
+  Per una sola camera nota, metti `billboardToNearestUser = false` (usa `Camera.main`).
 - `fadeOnSet` / `fadeDuration` → transizione sull'alpha quando cambia.
+- Lo script richiede `Canvas` + `CanvasGroup` sullo stesso GameObject (`RequireComponent`).
+- L'API pubblica (`SetText`, `SetColor`, `SetAlpha`, `Show`) è sicura anche prima di `Awake` (lazy-build interna).
 
 ### 2) Programmatica
 
@@ -66,9 +68,6 @@ ft.Show(false); // nasconde
   aggiungi un padre vuoto e ruota/sposta quello.
 - Il billboarding ruota il **Canvas**, non il testo figlio. Il testo figlio è
   fissato a `(0,0,0)` locale del Canvas.
-- `FindNearestUserCamera` scansiona tutte le camera every frame. Per mondi
-  grandi con molti oggetti fluttuanti, cacheala o usa `billboardToNearestUser = false`
-  per usare `Camera.main`.
 - Per testare in editor: premi Play e il testo ruota verso la camera principale.
   Per testare in VR: funziona se il sistema puntatore e la camera sono in place.
 - Se il testo non appare, verifica:
@@ -80,6 +79,6 @@ ft.Show(false); // nasconde
 ## File correlati
 
 - `CckFloatingText.cs` — componente principale.
+- `CckFloatingTextExample.cs` — esempio toggle/colore.
 - `CckDialog.cs` — dialogo llDialog-style.
 - `CckDialogLightToggle.cs` — esempio accendi/spegni luce.
-- `CckTouchText.cs` — hover/tap per il testo.

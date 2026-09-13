@@ -1,22 +1,25 @@
 // llDialog equivalent for ChilloutVR / Unity
-// Spawns a small World Space dialog panel near a target with a message line
-// and a row of tap buttons. Each button fires an event with its value.
+// Spawns a small World Space dialog panel near the owner with a message line
+// and a row of tap buttons. Each button fires OnButtonClicked with its value.
 //
 // Usage:
 //   var d = gameObject.AddComponent<CckDialog>();
-//   d.Open("Choose one", new[] { "Yes", "No", "Maybe" }, (value) => Debug.Log(value));
+//   d.OnButtonClicked = value => Debug.Log(value);
+//   d.Open("Pick one", new[]
+//   {
+//       new CckDialog.ButtonDef { label = "Yes", value = "yes" },
+//       new CckDialog.ButtonDef { label = "No",  value = "no" },
+//   });
 //
-// Or pre-configure in inspector and call Open/Close at runtime.
-//
-// Timeout: dialog auto-closes after dismissAfter seconds (0 = manual close only).
+// Or pre-configure in inspector and call Open()/Close() at runtime.
+// Requires: TextMeshPro package (already required by CckFloatingText).
 // In VR the buttons must be hit by the system pointer (VR ray/gaze) that feeds
-// Unity's event system — same requirement as CckTouchText.
+// Unity's event system. The scene needs an EventSystem.
 
 using UnityEngine;
 using UnityEngine.UI;
-using UnityEngine.EventSystems;
+using TMPro;
 using System;
-using System.Collections;
 using System.Collections.Generic;
 
 public class CckDialog : MonoBehaviour
@@ -26,7 +29,8 @@ public class CckDialog : MonoBehaviour
     {
         public string label;          // what the user sees
         public string value;          // what gets passed to OnButtonClicked
-        public Color? tint;           // optional button tint (null = default)
+        public bool useTint;          // Unity can't serialize Color? — explicit flag instead
+        public Color tint = Color.white;
     }
 
     [Header("Content")]
@@ -43,21 +47,23 @@ public class CckDialog : MonoBehaviour
     [Tooltip("Seconds before the dialog auto-closes (0 = manual only).")]
     public float dismissAfter = 30f;
 
-    [Tooltip("If true, remove the spawned panel GameObject when closed.")]
+    [Tooltip("If true, the panel GameObject is destroyed on Close. If false, it stays inactive for reuse.")]
     public bool destroyOnClose = true;
 
     [Header("Layout")]
-    public Vector3 spawnOffset = new Vector3(0f, 0.5f, 0f); // relative to this transform
+    public Vector3 spawnOffset = new Vector3(0f, 0.5f, 0f); // local offset from the owner
     public float panelWidth = 2.6f;
     public float panelHeight = 1.0f;
-    public float buttonHeight = 0.32f;
-    public float buttonSpacing = 0.08f;
+    public float buttonWidth = 0.9f;
+    public float buttonHeight = 0.34f;
+    public float buttonSpacing = 0.1f;
     public float fontSize = 36f;
 
     [Header("Appearance")]
     public Color panelColor = new Color(0.08f, 0.08f, 0.10f, 0.92f);
     public Color textColor = Color.white;
     public Color buttonTextColor = Color.white;
+    public Color buttonColor = Color.white;
     public Color buttonHoverColor = new Color(0.22f, 0.22f, 0.28f, 1f);
     public Color buttonPressedColor = new Color(0.05f, 0.05f, 0.08f, 1f);
 
@@ -67,28 +73,34 @@ public class CckDialog : MonoBehaviour
 
     // internals
     GameObject _panel;
-    GameObject _messageGo;
-    Text _messageText;
-    List<GameObject> _buttonGos = new List<GameObject>();
+    TMP_Text _messageText;
+    readonly List<GameObject> _buttonGos = new List<GameObject>();
     float _dismissAt;
     bool _open;
 
+    static Sprite _defaultSprite;
+
     public bool IsOpen => _open;
+    public Transform PanelTransform => _panel != null ? _panel.transform : null;
 
     // ---- public API ----
 
     /// <summary>
-    /// Show the dialog. If already open, reuses the panel (updates message + buttons).
+    /// Show the dialog. If already open, hides the old panel silently and rebuilds
+    /// (no OnClosed fired for the replaced instance).
     /// </summary>
     public void Open(string messageOverride = null, ButtonDef[] buttonsOverride = null, float? dismissAfterOverride = null)
     {
-        if (_open) Close(remain = false);
+        if (_open)
+        {
+            // Internal hide: no event, no destroy — we are about to rebuild.
+            _open = false;
+            if (_panel != null) _panel.SetActive(false);
+        }
 
-        // ensure a panel exists
         if (_panel == null)
             BuildPanel();
 
-        // content
         if (messageOverride != null) message = messageOverride;
         if (buttonsOverride != null) buttons = buttonsOverride;
         if (dismissAfterOverride.HasValue) dismissAfter = dismissAfterOverride.Value;
@@ -102,32 +114,35 @@ public class CckDialog : MonoBehaviour
     }
 
     /// <summary>
-    /// Hide and optionally destroy the panel.
+    /// Hide the dialog. Destroys the panel when destroyOnClose is true,
+    /// otherwise keeps it inactive for reuse.
     /// </summary>
-    public void Close(bool remain = true)
+    public void Close()
     {
         if (!_open && _panel == null) return;
         _open = false;
-        if (_panel != null) _panel.SetActive(false);
         OnClosed?.Invoke();
-        if (destroyOnClose && remain)
-        {
-            // keep it around inactive for reuse on next Open
-        }
-        else if (destroyOnClose)
-        {
+        if (destroyOnClose)
             DestroyPanel();
-        }
+        else if (_panel != null)
+            _panel.SetActive(false);
     }
 
     // ---- building ----
 
     void BuildPanel()
     {
-        // outer panel (the visual card)
         _panel = new GameObject("CckDialogPanel");
+        _panel.transform.SetParent(transform, false);
+        _panel.transform.localPosition = spawnOffset;
+        _panel.transform.localRotation = Quaternion.identity;
+
         var panelRt = _panel.AddComponent<RectTransform>();
+        panelRt.anchorMin = new Vector2(0.5f, 0.5f);
+        panelRt.anchorMax = new Vector2(0.5f, 0.5f);
+        panelRt.pivot = new Vector2(0.5f, 0.5f);
         panelRt.sizeDelta = new Vector2(panelWidth, panelHeight);
+
         var canvas = _panel.AddComponent<Canvas>();
         canvas.renderMode = RenderMode.WorldSpace;
         _panel.AddComponent<GraphicRaycaster>();
@@ -135,134 +150,123 @@ public class CckDialog : MonoBehaviour
         group.interactable = true;
         group.blocksRaycasts = true;
 
-        // message text
-        _messageGo = new GameObject("DialogMessage");
-        _messageGo.transform.SetParent(_panel.transform, false);
-        var msgRt = _messageGo.AddComponent<RectTransform>();
-        msgRt.anchorMin = new Vector2(0f, 1f);
-        msgRt.anchorMax = new Vector2(1f, 1f);
-        msgRt.pivot = new Vector2(0.5f, 1f);
-        msgRt.anchoredPosition = new Vector2(0f, -0.06f);
-        msgRt.sizeDelta = new Vector2(panelWidth - 0.2f, 0.5f);
-        _messageText = _messageGo.AddComponent<Text>();
-        _messageText.font = Resources.GetBuiltinResource<Font>("Arial.ttf", true);
-        _messageText.text = message;
-        _messageText.fontSize = (int)fontSize;
-        _messageText.color = textColor;
-        _messageText.alignment = TextAnchor.UpperCenter;
-        _messageText.horizontalOverflow = HorizontalWrapMode.Overflow;
-        _messageText.verticalOverflow = VerticalWrapMode.Overflow;
-        var msgOutline = _messageGo.AddComponent<Outline>();
-        msgOutline.effectColor = new Color(0f, 0f, 0f, 0.6f);
-        msgOutline.distance = 1f;
-
-        // background color via Image
         var bg = _panel.AddComponent<Image>();
-        var bgRt = _panel.GetComponent<RectTransform>();
         bg.sprite = GetDefaultSprite();
         bg.color = panelColor;
         bg.type = Image.Type.Sliced;
-        bg.pixelPerUnitMultiplier = 100f;
 
-        // placeholder for button row; we add buttons dynamically
-        // Layout: buttons arranged horizontally near the bottom of the panel.
+        var messageGo = new GameObject("DialogMessage");
+        messageGo.transform.SetParent(_panel.transform, false);
+        var msgRt = messageGo.AddComponent<RectTransform>();
+        msgRt.anchorMin = new Vector2(0.5f, 1f);
+        msgRt.anchorMax = new Vector2(0.5f, 1f);
+        msgRt.pivot = new Vector2(0.5f, 1f);
+
+        _messageText = messageGo.AddComponent<TextMeshProUGUI>();
+        _messageText.alignment = TextAlignmentOptions.Top;
+        _messageText.enableWordWrapping = true;
+        _messageText.richText = true;
     }
 
     void Populate()
     {
-        // remove old buttons
         foreach (var go in _buttonGos)
             if (go != null) Destroy(go);
         _buttonGos.Clear();
 
-        if (buttons == null) return;
+        const float topMargin = 0.08f;
+        const float msgHeight = 0.45f;
+        const float gapAfterMsg = 0.08f;
+        const float rowGap = 0.08f;
+        const float bottomMargin = 0.1f;
 
-        // compute how many rows we need
-        float totalBtnWidth = buttons.Length * buttonHeight + (buttons.Length - 1) * buttonSpacing;
-        // if too wide for panel, wrap into multiple rows
-        int perRow = Mathf.Max(1, Mathf.FloorToInt((panelWidth - 0.3f) / (buttonHeight + buttonSpacing)));
-        int rows = Mathf.CeilingToInt((float)buttons.Length / perRow);
+        // message block (top of the panel)
+        var msgRt = _messageText.rectTransform;
+        msgRt.anchoredPosition = new Vector2(0f, -topMargin);
+        msgRt.sizeDelta = new Vector2(panelWidth - 0.2f, msgHeight);
+        _messageText.text = message;
+        _messageText.fontSize = fontSize;
+        _messageText.color = textColor;
 
-        float rowHeight = buttonHeight + 0.06f;
-        float panelInnerHeight = panelHeight - 0.5f; // leave room for message at top
-        float startY = panelInnerHeight - 0.1f;     // start from bottom
+        int count = buttons != null ? buttons.Length : 0;
+        int perRow = Mathf.Max(1, Mathf.FloorToInt((panelWidth - 0.3f) / (buttonWidth + buttonSpacing)));
+        int rows = count > 0 ? Mathf.CeilToInt((float)count / perRow) : 0;
+        float rowHeight = buttonHeight + rowGap;
 
-        for (int i = 0; i < buttons.Length; i++)
+        // grow the panel if the buttons don't fit
+        float neededHeight = topMargin + msgHeight + gapAfterMsg + rows * buttonHeight + (rows - 1) * rowGap + bottomMargin;
+        if (count > 0 && neededHeight > panelHeight)
+        {
+            panelHeight = neededHeight;
+            _panel.GetComponent<RectTransform>().sizeDelta = new Vector2(panelWidth, panelHeight);
+        }
+
+        float buttonsTop = topMargin + msgHeight + gapAfterMsg;
+
+        for (int i = 0; i < count; i++)
         {
             int row = i / perRow;
             int col = i % perRow;
-            int rowCount = rows;
-            float rowY = startY - row * rowHeight;
+            int inRow = Math.Min(perRow, count - row * perRow);
+            float rowWidth = inRow * buttonWidth + (inRow - 1) * buttonSpacing;
+            float x = -rowWidth / 2f + buttonWidth / 2f + col * (buttonWidth + buttonSpacing);
+            float y = -(buttonsTop + buttonHeight / 2f + row * rowHeight);
 
-            var btn = new GameObject("DialogButton" + i);
-            btn.transform.SetParent(_panel.transform, false);
+            var btnGo = new GameObject("DialogButton" + i);
+            btnGo.transform.SetParent(_panel.transform, false);
 
-            var btnRt = btn.AddComponent<RectTransform>();
-            btnRt.sizeDelta = new Vector2(buttonHeight, buttonHeight);
-            float xPos = -panelWidth / 2f + 0.15f + col * (buttonHeight + buttonSpacing) + buttonHeight / 2f;
-            btnRt.anchoredPosition = new Vector2(xPos, rowY);
+            var btnRt = btnGo.AddComponent<RectTransform>();
+            btnRt.anchorMin = new Vector2(0.5f, 1f);
+            btnRt.anchorMax = new Vector2(0.5f, 1f);
+            btnRt.pivot = new Vector2(0.5f, 0.5f);
+            btnRt.sizeDelta = new Vector2(buttonWidth, buttonHeight);
+            btnRt.anchoredPosition = new Vector2(x, y);
 
-            var btnImg = btn.AddComponent<Image>();
+            var btnImg = btnGo.AddComponent<Image>();
             btnImg.sprite = GetDefaultSprite();
-            btnImg.color = Color.white;
             btnImg.type = Image.Type.Sliced;
-            var colorBlock = new ColorBlock
+
+            Color normal = buttons[i].useTint ? buttons[i].tint : buttonColor;
+            var button = btnGo.AddComponent<Button>();
+            button.transition = Selectable.Transition.ColorTint;
+            button.targetGraphic = btnImg;
+            button.colors = new ColorBlock
             {
-                normalColor = buttons[i].tint ?? Color.white,
-                highlightedColor = buttons[i].tint ?? buttonHoverColor,
+                normalColor = normal,
+                highlightedColor = buttons[i].useTint ? buttons[i].tint : buttonHoverColor,
                 pressedColor = buttonPressedColor,
                 disabledColor = new Color(0.4f, 0.4f, 0.4f, 1f),
                 colorMultiplier = 1f,
                 fadeDuration = 0.1f,
             };
-            var button = btn.AddComponent<Button>();
-            button.colors = colorBlock;
-            button.transition = Selectable.Transition.ColorTint;
-            button.interactable = true;
 
-            // text on the button
             var labelGo = new GameObject("ButtonLabel");
-            labelGo.transform.SetParent(btn.transform, false);
+            labelGo.transform.SetParent(btnGo.transform, false);
             var labelRt = labelGo.AddComponent<RectTransform>();
             labelRt.anchorMin = Vector2.zero;
             labelRt.anchorMax = Vector2.one;
             labelRt.pivot = new Vector2(0.5f, 0.5f);
             labelRt.sizeDelta = Vector2.zero;
-            var labelText = labelGo.AddComponent<Text>();
-            labelText.font = Resources.GetBuiltinResource<Font>("Arial.ttf", true);
+            var labelText = labelGo.AddComponent<TextMeshProUGUI>();
             labelText.text = buttons[i].label;
-            labelText.fontSize = Mathf.Max(18, (int)(fontSize * 0.7f));
+            labelText.fontSize = Mathf.Max(18, fontSize * 0.55f);
             labelText.color = buttonTextColor;
-            labelText.alignment = TextAnchor.MiddleCenter;
+            labelText.alignment = TextAlignmentOptions.Center;
+            labelText.enableWordWrapping = false;
 
-            // click handler
             int index = i;
             button.onClick.AddListener(() => OnButtonClickedInternal(buttons[index].value));
 
-            _buttonGos.Add(btn);
-
-            // raycast target is on, but ensure the button is pickable
-            var raycasterCheck = btn.AddComponent<GraphicRaycaster>();
-            // not needed — Button already handles via Image; but harmless
-            Destroy(raycasterCheck);
-        }
-
-        // size panel height to fit rows if needed
-        float neededHeight = 0.5f + rows * rowHeight + 0.1f;
-        if (neededHeight > panelHeight)
-        {
-            var prt = _panel.GetComponent<RectTransform>();
-            prt.sizeDelta = new Vector2(panelWidth, neededHeight);
-            panelHeight = neededHeight;
+            _buttonGos.Add(btnGo);
         }
     }
 
     void PlacePanel()
     {
-        // position the panel just above the owner, facing up by default;
-        // LateUpdate billboarding (if any) rotates it toward the camera.
-        transform.position = transform.position + spawnOffset;
-        transform.rotation = Quaternion.Euler(0f, 0f, 0f);
+        // Panel is a child of the owner: re-apply the local offset every Open so
+        // reopening never accumulates drift, and the owner itself never moves.
+        _panel.transform.localPosition = spawnOffset;
+        _panel.transform.localRotation = Quaternion.identity;
     }
 
     void OnButtonClickedInternal(string value)
@@ -271,15 +275,13 @@ public class CckDialog : MonoBehaviour
         Close();
     }
 
-    // ---- update ----
+    // ---- timeout ----
 
     void Update()
     {
         if (!_open || _panel == null) return;
         if (dismissAfter > 0 && Time.time >= _dismissAt)
-        {
             Close();
-        }
     }
 
     // ---- cleanup ----
@@ -288,11 +290,13 @@ public class CckDialog : MonoBehaviour
     {
         if (_panel != null)
         {
-            Destroy(_panel);
+            if (Application.isPlaying)
+                Destroy(_panel);
+            else
+                DestroyImmediate(_panel);
             _panel = null;
         }
         _buttonGos.Clear();
-        _messageGo = null;
         _messageText = null;
     }
 
@@ -305,11 +309,13 @@ public class CckDialog : MonoBehaviour
 
     static Sprite GetDefaultSprite()
     {
-        // Unity has a built-in 1x1 white texture; wrap it as a sprite once.
-        // This is cached by Unity internally; calling FromTexture every time is fine.
-        return Sprite.Create(
-            Resources.GetBuiltinResource<Texture2D>("white4x4Texture.png", true),
-            new Rect(0, 0, 1, 1),
-            new Vector2(0.5f, 0.5f));
+        if (_defaultSprite == null)
+        {
+            _defaultSprite = Sprite.Create(
+                Texture2D.whiteTexture,
+                new Rect(0, 0, 1, 1),
+                new Vector2(0.5f, 0.5f));
+        }
+        return _defaultSprite;
     }
 }

@@ -8,6 +8,7 @@ using TMPro;
 using System.Collections;
 
 [RequireComponent(typeof(CanvasGroup))]
+[RequireComponent(typeof(Canvas))]
 public class CckFloatingText : MonoBehaviour
 {
     [Header("Text content")]
@@ -36,10 +37,24 @@ public class CckFloatingText : MonoBehaviour
     // runtime state
     TMP_Text _tmp;
     CanvasGroup _group;
-    Camera _userCamera;
+    bool _built;
+    Camera _cachedCam;
+    float _nextCamScan;
+
+    [Tooltip("How often (seconds) to re-scan for the nearest camera. 0 = every frame.")]
+    public float cameraRescanInterval = 0.5f;
 
     void Awake()
     {
+        EnsureBuilt();
+        ApplyInspectorState();
+    }
+
+    void EnsureBuilt()
+    {
+        if (_built) return;
+        _built = true;
+
         _group = GetComponent<CanvasGroup>();
         if (_group == null) _group = gameObject.AddComponent<CanvasGroup>();
 
@@ -67,14 +82,33 @@ public class CckFloatingText : MonoBehaviour
         SetAlpha(alpha);
     }
 
+    void ApplyInspectorState()
+    {
+        if (_tmp == null) return;
+        _tmp.text = text;
+        _tmp.color = textColor;
+        _group.alpha = alpha;
+    }
+
     void LateUpdate()
     {
         if (!billboardToCamera) return;
-        var cam = billboardToNearestUser ? FindNearestUserCamera() : Camera.main;
+        var cam = ResolveCamera();
         if (cam != null)
         {
             transform.forward = cam.transform.forward;
         }
+    }
+
+    Camera ResolveCamera()
+    {
+        if (!billboardToNearestUser) return Camera.main;
+        if (cameraRescanInterval <= 0f || Time.unscaledTime >= _nextCamScan || _cachedCam == null)
+        {
+            _cachedCam = FindNearestUserCamera();
+            _nextCamScan = Time.unscaledTime + Mathf.Max(0.1f, cameraRescanInterval);
+        }
+        return _cachedCam;
     }
 
     Camera FindNearestUserCamera()
@@ -91,29 +125,37 @@ public class CckFloatingText : MonoBehaviour
         return best;
     }
 
-    // public API (call these from other scripts / CCK interactions)
+    // public API (safe to call before Awake: lazy-builds first)
     public void SetText(string newText)
     {
+        EnsureBuilt();
         text = newText ?? "";
+        if (_tmp == null) return;
         _tmp.text = text;
         CoherenceResize();
     }
 
     public void SetColor(Color c)
     {
+        EnsureBuilt();
         textColor = c;
+        if (_tmp == null) return;
         _tmp.color = c;
     }
 
     public void SetAlpha(float a)
     {
+        EnsureBuilt();
         alpha = Mathf.Clamp01(a);
+        if (_group == null) return;
         if (fadeOnSet) FadeTo(alpha);
         else _group.alpha = alpha;
     }
 
     public void Show(bool show)
     {
+        EnsureBuilt();
+        if (_group == null) return;
         _group.interactable = show;
         _group.blocksRaycasts = show;
         FadeTo(show ? alpha : 0f);
@@ -121,7 +163,7 @@ public class CckFloatingText : MonoBehaviour
 
     void CoherenceResize()
     {
-        if (autoFitHeight)
+        if (autoFitHeight && _tmp != null)
         {
             _tmp.ForceMeshUpdate();
             var w = _tmp.bounds.size.x;

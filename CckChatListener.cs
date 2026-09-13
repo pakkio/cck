@@ -1,25 +1,22 @@
-// CckChatListener.cs — riceve messaggi dalla chat di ChilloutVR.
+// CckChatListener.cs — receive messages from the world chat.
 //
-// Attenzione: non esiste un'API universale, documentata pubblicamente, per
-// "leggere la chat del mondo" da Unity in CCK. Molti mondi espongono la
-// comunicazione tramite eventi proprietari (es. un componente Communication
-// con un'event delegate, un flusso osservabile, o un meccanismo di webhook).
+// There is no universal, publicly documented CCK API for "read world chat"
+// from Unity. Worlds expose communication through their own components, so
+// this script has two modes:
 //
-// Questo script:
-//   - di default, in DebugOnly, simula la ricezione tramite SimulateMessage
-//     per testare in editor.
-//   - se UseCckCommunication è abilitato e la scena espone un canale CCK,
-//     tenta di ascoltare sul canale di chat.
-//   - espone un'estension point `Protected OnMessageReceivedInternal` da
-//     sovrascrivere o collegare a un canale specifico della scena.
+//   - Local/test: call SimulateMessage() from the editor or tests to drive
+//     the filter + handler pipeline without a world connection.
+//   - World-bound: subclass and override OnMessageReceivedInternal, or call
+//     Receive() from the world's chat component callback:
 //
-// Uso:
+//       void OnEnable() { myWorldComms.OnChat += (s, m, c) => listener.Receive(s, m, c); }
+//
+// Usage:
 //   var listener = gameObject.AddComponent<CckChatListener>();
-//   listener.OnMessageReceived = (sender, message, channel, tipo) =>
+//   listener.RegisterHandler((sender, message, channel, tipo) =>
 //   {
-//       Debug.Log($"Trovato: {sender}: {message}");
-//   };
-//   // test in editor senza mondo:
+//       Debug.Log($"Got: {sender}: {message}");
+//   });
 //   listener.SimulateMessage("Tu", "ciao", 0, CckChatListener.ChatType.Normal);
 
 using UnityEngine;
@@ -35,200 +32,162 @@ public class CckChatListener : MonoBehaviour
         Shout = 2,
     }
 
-    [Header("Modalità")]
-    [Tooltip("Se true, i messaggi non vengono ricevuti dalla chat del mondo, ma solo tramite SimulateMessage (per test).")]
-    public bool DebugOnly = true;
+    [Header("Filters")]
+    [Tooltip("Only messages on this channel pass. 0 = default channel.")]
+    public int channel = 0;
 
-    [Tooltip("Se true, tenta di usare il canale di ascolto CCK (se disponibile nella scena).")]
-    public bool UseCckCommunication = false;
+    [Tooltip("When true, all messages on the channel pass. When false, only messages starting with commandPrefix.")]
+    public bool listenToAll = true;
 
-    [Header("Filtri")]
-    [Tooltip("Canale da ascoltare (0 = default).")]
-    public int Channel = 0;
+    [Tooltip("Command prefix used when listenToAll is false (e.g. '!/lamp').")]
+    public string commandPrefix = "!/lamp";
 
-    [Tooltip("Se true, ascolta tutti i messaggi. Se false, filtra per CommandPrefix.")]
-    public bool ListenToAll = true;
-
-    [Tooltip("Prefisso comando (es. '!/lamp') usato quando ListenToAll = false.")]
-    public string CommandPrefix = "!/lamp";
-
-    [Tooltip("Se true, ignora i messaggi inviati da questo stesso GameObject.")]
-    public bool FilterOwner = true;
+    [Tooltip("When true, ignore messages sent by this same GameObject.")]
+    public bool filterOwner = true;
 
     [Header("Debug")]
-    [Tooltip("Se true, logga tutti i messaggi ricevuti (anche quelli filtrati).")]
-    public bool LogAll = false;
+    [Tooltip("Log every received message, including ones rejected by filters.")]
+    public bool logAll = false;
 
-    // ---- eventi ----
+    [Tooltip("Keep rejected messages in the queue for inspection. Otherwise only accepted ones are queued.")]
+    public bool queueRejected = false;
 
-    /// <summary>
-    /// Lanciato per ogni messaggio ricevuto (o filtrato, a seconda di ListenToAll).
-    /// </summary>
+    [Tooltip("Max messages kept in the inspection queue.")]
+    public int maxQueueSize = 100;
+
+    /// <summary>Fired for every message that passes all filters.</summary>
     public event Action<string, string, int, ChatType> OnMessageReceived;
 
-    /// <summary>
-    /// Handler per messaggi che passano il filtro (prefisso o canale). Più efficiente
-    /// se ti servono solo alcuni messaggi.
-    /// </summary>
-    public event Action<string, string, int, ChatType> OnMessageFiltered;
+    // ---- internal state (main thread only — no locking needed) ----
 
-    // ---- stato interno ----
-
-    // coda dei messaggi ricevuti (per test o per buffering)
-    Queue<ChatMessage> _queue = new Queue<ChatMessage>();
-    int _maxQueueSize = 100;
-
-    // mittente corrente da ignorare (opzionale)
-    string _ignoreSender;
+    readonly Queue<ChatMessage> _queue = new Queue<ChatMessage>();
+    readonly HashSet<string> _ignoredSenders = new HashSet<string>();
+    readonly HashSet<string> _allowedSenders = new HashSet<string>();
 
     // ---- public API ----
 
     /// <summary>
-    /// Simula la ricezione di un messaggio (per test in editor).
+    /// Entry point for real world messages AND simulated ones.
+    /// Call this from the world's chat callback, or from tests.
     /// </summary>
-    public void SimulateMessage(string sender, string message, int channel, ChatType tipo)
+    public void Receive(string sender, string message, int ch, ChatType tipo)
     {
-        OnMessageReceivedInternal(sender, message, channel, tipo);
+        OnMessageReceivedInternal(sender, message, ch, tipo);
     }
 
-    /// <summary>
-    /// Registra un handler per messaggi ricevuti.
-    /// </summary>
+    /// <summary>Simulate a message (editor tests without a world).</summary>
+    public void SimulateMessage(string sender, string message, int ch, ChatType tipo)
+    {
+        Receive(sender, message, ch, tipo);
+    }
+
     public void RegisterHandler(Action<string, string, int, ChatType> handler)
     {
         OnMessageReceived += handler;
     }
 
-    /// <summary>
-    /// Rimuovi un handler.
-    /// </summary>
     public void UnregisterHandler(Action<string, string, int, ChatType> handler)
     {
         OnMessageReceived -= handler;
     }
 
-    /// <summary>
-    /// Ignora un mittente specifico (es. se sei tu stesso).
-    /// </summary>
+    /// <summary>Ignore a specific sender. Call again with another name to ignore several.</summary>
     public void IgnoreSender(string sender)
     {
-        _ignoreSender = sender;
+        if (!string.IsNullOrEmpty(sender)) _ignoredSenders.Add(sender);
     }
 
-    /// <summary>
-    /// Riceve solo da questo mittente (esclude tutti gli altri).
-    /// </summary>
+    public void UnignoreSender(string sender)
+    {
+        _ignoredSenders.Remove(sender);
+    }
+
+    /// <summary>Only receive from these senders (empty set = everyone allowed).</summary>
     public void AllowSender(string sender)
     {
-        _ignoreSender = null;
-        OnMessageReceived = (s, m, c, t) =>
-        {
-            if (s == sender)
-            {
-                Debug.Log($"[CckChatListener] Messaggio da {sender}: {m}");
-                OnMessageFiltered?.Invoke(s, m, c, t);
-            }
-        };
+        if (!string.IsNullOrEmpty(sender)) _allowedSenders.Add(sender);
+    }
+
+    public void AllowAllSenders()
+    {
+        _allowedSenders.Clear();
     }
 
     // ---- internal ----
 
     /// <summary>
-    /// Sovrascrivi questo metodo per collegare il listener al canale di
-    /// comunicazione CCK della scena.
-    ///
-    /// Questo è il punto di ingresso per i messaggi reali del mondo.
-    /// Se non sovrascritto, i messaggi non arrivano dal mondo (a meno di
-    /// DebugOnly/SimulateMessage).
+    /// Override in a subclass to hook the world's chat component directly.
+    /// The default implementation just runs the filter pipeline.
     /// </summary>
-    protected virtual void OnMessageReceivedInternal(string sender, string message, int channel, ChatType tipo)
+    protected virtual void OnMessageReceivedInternal(string sender, string message, int ch, ChatType tipo)
     {
         if (string.IsNullOrEmpty(message)) return;
 
-        // filtro mittente
-        if (FilterOwner && sender == gameObject.name)
+        if (filterOwner && sender == gameObject.name)
             return;
 
-        if (_ignoreSender != null && sender == _ignoreSender)
+        if (_ignoredSenders.Contains(sender))
             return;
 
-        // log opzionale
-        if (LogAll)
-            Debug.Log($"[CckChatListener] Ricevuto: {sender}: {message} (canale {channel}, tipo {tipo})");
+        if (_allowedSenders.Count > 0 && !_allowedSenders.Contains(sender))
+            return;
 
-        // decisione: ascoltiamo tutti o solo quelli che passano il filtro?
-        bool passesFilter = ListenToAll
-            ? true
-            : (message.StartsWith(CommandPrefix));
+        bool passesChannel = ch == channel;
+        bool passesPrefix = listenToAll
+            || (!string.IsNullOrEmpty(commandPrefix) && message.StartsWith(commandPrefix));
 
-        if (passesFilter)
+        if (logAll)
+            Debug.Log($"[CckChatListener] got {sender}: {message} (ch {ch}, {tipo})"
+                + $" pass={passesChannel && passesPrefix}");
+
+        if (passesChannel && passesPrefix)
         {
-            OnMessageReceived?.Invoke(sender, message, channel, tipo);
-            OnMessageFiltered?.Invoke(sender, message, channel, tipo);
+            EnqueueMessage(new ChatMessage(sender, message, ch, tipo));
+            DispatchSafe(sender, message, ch, tipo);
         }
-        else
+        else if (queueRejected)
         {
-            // se il messaggio non passa il filtro, lo mettiamo comunque in coda
-            // per log (opzionale) ma non lo dispatchiamo agli handler principali
-            EnqueueMessage(new ChatMessage(sender, message, channel, tipo));
+            EnqueueMessage(new ChatMessage(sender, message, ch, tipo));
         }
     }
 
-    // ---- comunicazione CCK (placeholder) ----
-
-    /// <summary>
-    /// Se UseCckCommunication è true, questo metodo cerca di connettersi al
-    /// canale di comunicazione della scena.
-    ///
-    /// Questa è una placeholder: l'implementazione esatta dipende dal mondo.
-    /// Per renderlo funzionale, sovrascrivi questo metodo o collega un
-    /// componente della scena che espone l'evento di chat.
-    /// </summary>
-    void ConnectToCckChannel()
+    void DispatchSafe(string sender, string message, int ch, ChatType tipo)
     {
-        if (!UseCckCommunication) return;
-
-        var comm = FindObjectOfType<CVRCommunication>();
-        if (comm != null)
+        if (OnMessageReceived == null) return;
+        foreach (Action<string, string, int, ChatType> handler
+            in OnMessageReceived.GetInvocationList())
         {
-            Debug.Log("[CckChatListener] Canale CCK trovato (CVRCommunication) sulla scena. Per ascoltare, sovrascrivi OnMessageReceivedInternal o collega l'evento del componente.");
-            return;
+            try
+            {
+                handler(sender, message, ch, tipo);
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[CckChatListener] handler failed: {e.Message}");
+            }
         }
-
-        Debug.LogWarning("[CckChatListener] Nessun componente comunicazione CCK riconosciuto; l'ascolto non è stato configurato. Usa DebugOnly + SimulateMessage per testare.");
     }
 
-    void Awake()
-    {
-        _maxQueueSize = 100;
-        ConnectToCckChannel();
-    }
-
-    // ---- coda interna ----
+    // ---- inspection queue ----
 
     void EnqueueMessage(ChatMessage msg)
     {
-        lock (_queue)
-        {
-            if (_queue.Count >= _maxQueueSize)
-                _queue.Dequeue();
-            _queue.Enqueue(msg);
-        }
+        if (_queue.Count >= Mathf.Max(1, maxQueueSize))
+            _queue.Dequeue();
+        _queue.Enqueue(msg);
     }
 
     public IReadOnlyList<ChatMessage> GetQueue()
     {
-        lock (_queue)
-            return new List<ChatMessage>(_queue).AsReadOnly();
+        return new List<ChatMessage>(_queue).AsReadOnly();
     }
 
     public void ClearQueue()
     {
-        lock (_queue)
-            _queue.Clear();
+        _queue.Clear();
     }
 
-    // ---- struct del messaggio ----
+    // ---- message struct ----
 
     public struct ChatMessage
     {
@@ -237,11 +196,11 @@ public class CckChatListener : MonoBehaviour
         public int Channel;
         public ChatType Type;
 
-        public ChatMessage(string sender, string message, int channel, ChatType type)
+        public ChatMessage(string sender, string message, int ch, ChatType type)
         {
             Sender = sender;
             Message = message;
-            Channel = channel;
+            Channel = ch;
             Type = type;
         }
     }

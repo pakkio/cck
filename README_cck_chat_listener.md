@@ -2,63 +2,47 @@
 
 ## Cos'è
 
-`CckChatListener.cs` è un helper per ricevere messaggi dalla chat di ChilloutVR
-dai script Unity. Copre il caso d'uso più comune:
-
-- ascoltare tutti i messaggi del mondo e reagire (es. comando "accendi")
-- filtrare per canale, per mittente, per prefisso
-- loggare in console per debug
-
-Lo script **non** fa parte della chat di Second Life — riceve da
-*ChilloutVR* e può richiedere una componente CCK di comunicazione o una
-configurazione specifica del mondo.
+`CckChatListener.cs` riceve messaggi della chat di ChilloutVR negli script Unity.
+Punto d'ingresso unico: `Receive(sender, message, channel, tipo)` — da chiamare
+dal callback chat del mondo, oppure via `SimulateMessage()` per i test in editor.
+Non referenzia tipi CCK: compila ovunque, il binding avviene nel mondo.
 
 ## Setup
 
 1. **Prendere un GameObject** (o crearne uno vuoto) come "ascoltatore centrale".
-2. **Aggiungere `CckChatListener.cs`** a quel GameObject.
-3. **Se il mondo usa un componente di comunicazione CCK**, abilitare l'opzione
-   corrispondente nello script (vedi `UseCckCommunication` sotto).
-4. **In editor**, per testare senza un mondo connesso, usa
-   `DebugOnly = true` e invia messaggi simulati con `SimulateMessage`.
+2. **Aggiungere `CckChatListener.cs`** e registrare un handler via `RegisterHandler`.
+3. **Legare il mondo**: dal callback chat del mondo chiamare `listener.Receive(...)`,
+   oppure sottoclassare e fare override di `OnMessageReceivedInternal`.
+4. **In editor**, senza mondo connesso, inviare messaggi simulati con `SimulateMessage`.
 
 ## Come si usa
 
 ### 1) Configurazione da inspector
 
-- `DebugOnly` → se true, i messaggi non vengono ricevuti dalla chat del mondo;
-  arrivano solo al console Unity (`Debug.Log`) e agli handler.
-- `UseCckCommunication` → se true, lo script cerca di usare il canale di
-  ascolto CCK (se disponibile nella scena).
-- `Channel` → canale da ascoltare (0 = default, o un numero specifico se il mondo lo usa).
-- `ListenToAll` → se true, ascolta tutti i messaggi; se false, filtra per
-  prefisso (vedi `CommandPrefix`).
-- `CommandPrefix` → se `ListenToAll = false`, riceve solo messaggi che iniziano
-  con questo prefisso (es. "!/lamp").
-- `FilterOwner` → se true, ignora i messaggi di questo stesso GameObject (self).
-- `MaxQueueSize` → dimensione massima della coda interna dei messaggi.
+- `channel` → passa solo il canale indicato (0 = default). Il filtro canale è sempre attivo.
+- `listenToAll` → se true, tutti i messaggi del canale passano; se false, solo quelli con prefisso `commandPrefix`.
+- `commandPrefix` → es. `!/lamp` (richiede prefisso non vuoto quando `listenToAll` è false).
+- `filterOwner` → ignora i messaggi il cui sender è il nome di questo GameObject.
+- `logAll` → logga anche i messaggi scartati; `queueRejected` li mette in coda; `maxQueueSize` la dimensiona.
 
 ### 2) Handler di ricezione
 
 ```csharp
 var listener = gameObject.AddComponent<CckChatListener>();
 
-listener.OnMessageReceived = (mittente, message, channel, tipo) =>
+listener.RegisterHandler((mittente, message, channel, tipo) =>
 {
     Debug.Log($"Ricevuto: {mittente}: {message}");
-    // logica di reazione, es. accendi luce se message contiene "accendi"
-};
+});
 ```
 
-Puoi registrare più handler chiamando `RegisterHandler` o assegnando
-`OnMessageReceived` più volte; il sistema li lancia in ordine di registrazione.
+Usa sempre `RegisterHandler`/`UnregisterHandler` (`+=`/`-=`). Non assegnare l'evento con `=`: cancelleresti gli altri handler.
 
 ### 3) Filtri avanzati
 
-- `OnMessageFiltered` → handler che riceve solo i messaggi che passano il filtro
-  (prefisso/channel). Più efficiente se ti servono solo alcuni messaggi.
-- `IgnoreSender(string)` → ignora un mittente specifico (es. se sei tu stesso).
-- `AllowSender(string)` → riceve solo da questo mittente (mutually exclusive con IgnoreSender).
+- `IgnoreSender(string)` / `UnignoreSender(string)` → ignora (anche multipli).
+- `AllowSender(string)` → whitelist cumulativa; `AllowAllSenders()` la azzera.
+  Handler che lancia eccezione non blocca gli altri (dispatch try/catch per handler).
 
 ### 4) Simulazione in editor (senza mondo)
 
@@ -70,26 +54,15 @@ Utilissimo per testare in editor senza un mondo connesso.
 
 ## Note importanti
 
-- **Non esiste una garanzia universale** su come la chat di ChilloutVR sia
-  esposta a Unity per l'ascolto. Alcuni mondi usano `CVRCommunication` con
-  un'API di evento, altri usano flussi 개인izzati. Se `UseCckCommunication = true`
-  e il mondo non ha quel canale, lo script logga un errore e non riceve nulla.
-- **In editor**, escluso `DebugOnly`, lo script non riceverà messaggi dal mondo
-  (non c'è un mondo connesso). Usa `SimulateMessage` per testare.
-- Per **comandi** (es. "accendi", "spegni"), usa `CommandPrefix` e un handler che
-  analizza il resto del messaggio.
-- Se vuoi **ascoltare un canale specifico**, imposta `Channel` e assicurati che
-  il canale sia quello su cui il mondo invia.
-- Se due handler sono registrati e uno fallisce, l'eccezione non blocca gli altri
-  (il dispatch è try/catch per handler).
-- Per **ascolto di comandi di stato** (es. "è accesa?"), non usare la chat come
-  sistema di stato — la chat è per comunicazioni, non per stato persistente.
-  Per stato, usa variabili condivise, un meccanismo di sincronizzazione CCK, o un
-  flag sul componente.
+- Il filtro canale è sempre attivo: `Receive` con canale diverso viene scartato
+  (o accodato se `queueRejected`).
+- Per comandi (es. "accendi"), usa `commandPrefix` + handler che analizza il resto.
+- La chat è comunicazione, non stato persistente: per lo stato usa componenti/sync CCK.
 
 ## Esempio: comando accendi/spegni dalla chat
 
-Vedi `CckChatListenerLightCommand.cs` (o integrare con `CckDialogLightToggle`).
+Registra un handler che chiama `GetComponent<CckDialogLightToggle>()` e invoca
+`ApriDialogo()`, oppure guida direttamente la luce. Vedi `CckDialogLightToggle.cs`.
 
 ## File correlati
 
