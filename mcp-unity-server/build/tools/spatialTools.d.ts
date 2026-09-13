@@ -1,0 +1,12 @@
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpUnity } from '../unity/mcpUnity.js';
+import { Logger } from '../utils/logger.js';
+export declare function registerGetBoundsTool(server: McpServer, mcpUnity: McpUnity, logger: Logger): void;
+export declare function registerPlaceNextToTool(server: McpServer, mcpUnity: McpUnity, logger: Logger): void;
+export declare function registerFindLocalAssetsTool(server: McpServer, mcpUnity: McpUnity, logger: Logger): void;
+export declare function registerImportLocalFileTool(server: McpServer, mcpUnity: McpUnity, logger: Logger): void;
+export declare function registerMeasureDistanceTool(server: McpServer, mcpUnity: McpUnity, logger: Logger): void;
+export declare function registerGetFloorHeightTool(server: McpServer, mcpUnity: McpUnity, logger: Logger): void;
+export declare function registerGetNearbyObjectsTool(server: McpServer, mcpUnity: McpUnity, logger: Logger): void;
+export declare function registerFrameCameraOnTool(server: McpServer, mcpUnity: McpUnity, logger: Logger): void;
+export declare function registerSpatialTools(server: McpServer, mcpUnity: McpUnity, logger: Logger): void;

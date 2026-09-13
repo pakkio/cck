@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-pipeline"
+version = "0.1.0"
+description = "MCP stdio server bridging Blender + Unity for essential vehicle + CCK workflows"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0,<2.0.0",
+    "websockets>=13.0",
+]
+
+[project.scripts]
+mcp-pipeline = "mcp_pipeline.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_pipeline"]

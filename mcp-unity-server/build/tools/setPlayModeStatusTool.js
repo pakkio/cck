@@ -1,0 +1,57 @@
+import { McpUnityError, ErrorType } from '../utils/errors.js';
+import * as z from 'zod';
+import { getToolTimeout } from '../utils/timeouts.js';
+const toolName = 'set_play_mode_status';
+const toolDescription = "Controls Unity play mode. Actions: 'play' (start or unpause), 'pause' (toggle pause), 'stop' (exit play mode), 'step' (advance one frame while paused).";
+const paramsSchema = z.object({
+    action: z.enum(['play', 'pause', 'stop', 'step']).describe("The play mode action to execute: 'play', 'pause', 'stop', or 'step'")
+});
+export function registerSetPlayModeStatusTool(server, mcpUnity, logger) {
+    logger.info(`Registering tool: ${toolName}`);
+    server.tool(toolName, toolDescription, paramsSchema.shape, async (params) => {
+        try {
+            logger.info(`Executing tool: ${toolName}`, params);
+            const result = await toolHandler(mcpUnity, params);
+            logger.info(`Tool execution successful: ${toolName}`);
+            return result;
+        }
+        catch (error) {
+            logger.error(`Tool execution failed: ${toolName}`, error);
+            throw error;
+        }
+    });
+}
+async function toolHandler(mcpUnity, params) {
+    const validatedParams = paramsSchema.parse(params);
+    const response = await mcpUnity.sendRequest({
+        method: toolName,
+        params: validatedParams
+    }, { timeout: getToolTimeout(toolName) });
+    if (!response.success) {
+        throw new McpUnityError(ErrorType.TOOL_EXECUTION, response.message || `Failed to execute play mode action: ${validatedParams.action}`);
+    }
+    const statusText = response.isPlaying
+        ? (response.isPaused ? 'Playing (paused)' : 'Playing')
+        : 'Edit mode';
+    // 'play'/'stop' are applied a tick after Unity answers, so isPlaying/isPaused describe the
+    // requested target, not an observed state. Don't report it as an accomplished fact.
+    const transitionPending = response.transitionPending === true;
+    const text = transitionPending
+        ? `Play mode action '${validatedParams.action}' accepted. Target state: ${statusText} (applied on the next editor tick; call 'get_play_mode_status' to confirm)`
+        : `Play mode action '${validatedParams.action}' executed successfully. Current state: ${statusText}`;
+    return {
+        content: [
+            {
+                type: 'text',
+                text
+            }
+        ],
+        structuredContent: {
+            action: validatedParams.action,
+            isPlaying: response.isPlaying,
+            isPaused: response.isPaused,
+            transitionPending
+        },
+        isError: false
+    };
+}

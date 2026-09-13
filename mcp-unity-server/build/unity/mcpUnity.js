@@ -1,0 +1,477 @@
+import { v4 as uuidv4 } from 'uuid';
+import { fileURLToPath } from 'url';
+import { McpUnityError, ErrorType } from '../utils/errors.js';
+import { UnityConnection, ConnectionState } from './unityConnection.js';
+import { CommandQueue } from './commandQueue.js';
+import { resolveUnityConnectionConfig } from './unityConnectionConfig.js';
+import { isReplayableMethod } from './replayableMethods.js';
+// Re-export connection types for consumers
+export { ConnectionState } from './unityConnection.js';
+export class McpUnity {
+    logger;
+    port = 8090;
+    host = 'localhost';
+    requestTimeout = 10000;
+    authToken;
+    connection = null;
+    pendingRequests = new Map();
+    clientName = '';
+    // Connection state listeners
+    stateListeners = new Set();
+    // Command queue for handling commands during disconnection
+    commandQueue;
+    queueingEnabled;
+    // Flag to track if we're currently replaying queued commands
+    isReplayingQueue = false;
+    // In-flight requests whose socket died mid-request and which are safe to re-send once
+    // reconnected. Their entries stay in pendingRequests (so the original promise and timeout
+    // remain armed); only the raw message is re-sent.
+    pendingReplay = [];
+    constructor(logger, config) {
+        this.logger = logger;
+        this.commandQueue = new CommandQueue(logger, config?.queue);
+        this.queueingEnabled = config?.queueingEnabled ?? true;
+    }
+    /**
+     * Enable or disable command queuing
+     */
+    setQueueingEnabled(enabled) {
+        this.queueingEnabled = enabled;
+        this.logger.info(`Command queuing ${enabled ? 'enabled' : 'disabled'}`);
+    }
+    /**
+     * Check if command queuing is enabled
+     */
+    get isQueueingEnabled() {
+        return this.queueingEnabled;
+    }
+    /**
+     * Get command queue statistics
+     */
+    getQueueStats() {
+        return this.commandQueue.getStats();
+    }
+    /**
+     * Get number of commands currently queued
+     */
+    get queuedCommandCount() {
+        return this.commandQueue.size;
+    }
+    /**
+     * Start the Unity connection
+     * @param clientName Optional name of the MCP client connecting to Unity
+     */
+    async start(clientName) {
+        try {
+            this.logger.info('Attempting to read startup parameters...');
+            await this.parseAndSetConfig();
+            this.clientName = clientName || '';
+            // Create connection with configuration
+            const config = {
+                host: this.host,
+                port: this.port,
+                requestTimeout: this.requestTimeout,
+                clientName: this.clientName,
+                authToken: this.authToken,
+                // Use defaults for reconnection and heartbeat from UnityConnection
+            };
+            this.connection = new UnityConnection(this.logger, config);
+            // Set up event handlers
+            this.connection.on('stateChange', (change) => {
+                this.handleStateChange(change);
+            });
+            this.connection.on('message', (data) => {
+                this.handleMessage(data);
+            });
+            this.connection.on('error', (error) => {
+                // Log only - do NOT reject pending requests here. This fires on every raw WebSocket
+                // error, including a transient reset that immediately precedes a clean reconnect (the
+                // common case when Unity closes the socket for a domain reload / Play mode transition).
+                // Rejecting eagerly turned an in-flight request that Unity would have answered within
+                // milliseconds into a hard client-visible failure ("Connection failed") even though the
+                // underlying Unity-side operation succeeded. Pending requests are already correctly
+                // rejected in handleStateChange() once the connection reaches the terminal Disconnected
+                // state (manual stop or max reconnection attempts) - short of that, let them ride out
+                // either a matching response or their own per-request timeout.
+                this.logger.error(`Connection error: ${error.message}`);
+            });
+            this.logger.info('Attempting to connect to Unity WebSocket...');
+            await this.connection.connect();
+            this.logger.info('Successfully connected to Unity WebSocket');
+            if (clientName) {
+                this.logger.info(`Client identified to Unity as: ${clientName}`);
+            }
+        }
+        catch (error) {
+            this.logger.warn(`Could not connect to Unity WebSocket: ${error instanceof Error ? error.message : String(error)}`);
+            this.logger.warn('Will retry connection on next request (with automatic reconnection)');
+        }
+        return Promise.resolve();
+    }
+    /**
+     * Reads our configuration file and sets parameters of the server based on them.
+     */
+    async parseAndSetConfig() {
+        const config = await resolveUnityConnectionConfig(this.logger, {
+            modulePath: fileURLToPath(import.meta.url)
+        });
+        this.port = config.port;
+        this.host = config.host;
+        this.requestTimeout = config.requestTimeout;
+        this.authToken = config.authToken;
+    }
+    /**
+     * Handle connection state changes
+     */
+    handleStateChange(change) {
+        this.logger.debug(`Connection state changed: ${change.previousState} -> ${change.currentState}`);
+        // Notify all listeners
+        for (const listener of this.stateListeners) {
+            try {
+                listener(change);
+            }
+            catch (err) {
+                this.logger.error(`Error in state listener: ${err instanceof Error ? err.message : String(err)}`);
+            }
+        }
+        // Leaving Connected means the socket died under any in-flight requests. They will never be
+        // answered on the new socket unless re-sent, so triage them now rather than letting each sit
+        // until its own timeout (up to 300s for run_tests).
+        if (change.previousState === ConnectionState.Connected &&
+            (change.currentState === ConnectionState.Reconnecting ||
+                change.currentState === ConnectionState.Connecting)) {
+            this.triageInFlightRequests(change.reason);
+        }
+        // Handle specific state transitions
+        if (change.currentState === ConnectionState.Connected &&
+            (change.previousState === ConnectionState.Reconnecting ||
+                change.previousState === ConnectionState.Connecting)) {
+            // Connection restored - re-send surviving in-flight reads, then replay queued commands
+            this.replayInFlightRequests();
+            this.replayQueuedCommands();
+        }
+        else if (change.currentState === ConnectionState.Disconnected) {
+            // Clear the queue when we're fully disconnected (not reconnecting)
+            // This happens when max reconnection attempts are reached
+            if (change.reason?.includes('Max reconnection attempts')) {
+                this.commandQueue.clear(change.reason);
+            }
+            // Reject all pending requests when disconnected
+            this.rejectAllPendingRequests(new McpUnityError(ErrorType.CONNECTION, change.reason || 'Connection lost'));
+        }
+    }
+    /**
+     * Triage requests that were in flight when the socket dropped (Unity domain reload, Play mode
+     * transition, editor restart).
+     *
+     * Read-only methods are parked for replay on reconnect - their promise and timeout stay armed,
+     * so from the caller's perspective the reload is invisible as long as the reconnect beats the
+     * timeout. Everything else is rejected immediately: Unity does not deduplicate request ids, so a
+     * mutation that Unity may already have executed must never be silently re-sent, and leaving it
+     * pending would just stall the caller until an unrelated timeout with a less useful error.
+     */
+    triageInFlightRequests(reason) {
+        if (this.pendingRequests.size === 0)
+            return;
+        const suffix = reason ? ` (${reason})` : '';
+        for (const [id, pending] of Array.from(this.pendingRequests.entries())) {
+            const method = pending.request.method;
+            if (isReplayableMethod(method)) {
+                this.pendingReplay.push(pending.request);
+                this.logger.info(`Connection dropped with read-only '${method}' in flight; will re-send on reconnect`);
+                continue;
+            }
+            clearTimeout(pending.timeout);
+            this.pendingRequests.delete(id);
+            pending.reject(new McpUnityError(ErrorType.CONNECTION, `Connection to Unity dropped while '${method}' was in flight${suffix}. ` +
+                'The operation may or may not have been applied - it is not retried automatically because ' +
+                'Unity does not deduplicate requests and re-sending could apply it twice. ' +
+                'Check the current state before retrying.'));
+        }
+    }
+    /**
+     * Re-send in-flight read-only requests that survived a reconnect.
+     */
+    replayInFlightRequests() {
+        if (this.pendingReplay.length === 0)
+            return;
+        const toReplay = this.pendingReplay;
+        this.pendingReplay = [];
+        this.logger.info(`Re-sending ${toReplay.length} in-flight request(s) after reconnect`);
+        for (const request of toReplay) {
+            const id = request.id;
+            const pending = this.pendingRequests.get(id);
+            // Already resolved or timed out while we were disconnected - nothing to do.
+            if (!pending)
+                continue;
+            try {
+                this.connection.send(JSON.stringify(request));
+            }
+            catch (err) {
+                clearTimeout(pending.timeout);
+                this.pendingRequests.delete(id);
+                pending.reject(new McpUnityError(ErrorType.CONNECTION, `Failed to re-send '${request.method}' after reconnect: ${err instanceof Error ? err.message : String(err)}`));
+            }
+        }
+    }
+    /**
+     * Replay queued commands after connection is restored
+     */
+    async replayQueuedCommands() {
+        if (this.isReplayingQueue) {
+            this.logger.debug('Already replaying queue, skipping');
+            return;
+        }
+        const commands = this.commandQueue.drain();
+        if (commands.length === 0) {
+            return;
+        }
+        this.isReplayingQueue = true;
+        this.logger.info(`Replaying ${commands.length} queued commands`);
+        for (const command of commands) {
+            try {
+                // Send the command directly using internal method
+                const result = await this.sendRequestInternal(command.request, command.timeout);
+                command.resolve(result);
+                this.commandQueue.recordReplaySuccess();
+            }
+            catch (error) {
+                command.reject(error);
+            }
+        }
+        this.isReplayingQueue = false;
+        this.logger.info(`Finished replaying queued commands (${this.commandQueue.getStats().replayedCount} successful)`);
+    }
+    /**
+     * Handle messages received from Unity
+     */
+    handleMessage(data) {
+        try {
+            const response = JSON.parse(data);
+            const pendingCount = this.pendingRequests.size;
+            if (!response.id) {
+                this.logger.warn(`Ignoring Unity WebSocket message without request id; pending requests: ${pendingCount}`);
+                return;
+            }
+            if (!this.pendingRequests.has(response.id)) {
+                this.logger.warn(`Ignoring Unity response for unknown request ${response.id}; pending requests: ${pendingCount}`);
+                return;
+            }
+            this.logger.info(`Received Unity response for request ${response.id}; pending requests before match: ${pendingCount}`);
+            const request = this.pendingRequests.get(response.id);
+            clearTimeout(request.timeout);
+            this.pendingRequests.delete(response.id);
+            if (response.error) {
+                request.reject(new McpUnityError(ErrorType.TOOL_EXECUTION, response.error.message || 'Unknown error', response.error.details));
+            }
+            else {
+                request.resolve(response.result);
+            }
+        }
+        catch (e) {
+            this.logger.error(`Error parsing WebSocket message: ${e instanceof Error ? e.message : String(e)}`);
+        }
+    }
+    /**
+     * Reject all pending requests with an error
+     */
+    rejectAllPendingRequests(error) {
+        // Anything parked for replay is being rejected here too, so drop the parked copies rather
+        // than letting a later reconnect re-send a request whose promise is already settled.
+        this.pendingReplay = [];
+        for (const [id, request] of this.pendingRequests.entries()) {
+            clearTimeout(request.timeout);
+            request.reject(error);
+            this.pendingRequests.delete(id);
+        }
+    }
+    /**
+     * Stop the Unity connection and clean up resources
+     */
+    async stop() {
+        // Dispose the command queue
+        this.commandQueue.dispose();
+        if (this.connection) {
+            this.connection.disconnect('Server stopping');
+            this.connection.removeAllListeners();
+            this.connection = null;
+        }
+        this.rejectAllPendingRequests(new McpUnityError(ErrorType.CONNECTION, 'Server stopped'));
+        this.logger.info('Unity WebSocket client stopped');
+        return Promise.resolve();
+    }
+    /**
+     * Send a request to the Unity server
+     * @param request The request to send
+     * @param options Optional settings for the request
+     */
+    async sendRequest(request, options = {}) {
+        const { queueIfDisconnected = this.queueingEnabled, timeout } = options;
+        const requestId = request.id || uuidv4();
+        const message = {
+            ...request,
+            id: requestId
+        };
+        // If connected, send directly
+        if (this.isConnected) {
+            return this.sendRequestInternal(message, timeout);
+        }
+        // If not started, throw error
+        if (!this.connection) {
+            throw new McpUnityError(ErrorType.CONNECTION, 'Not started - call start() first');
+        }
+        // If reconnecting and queuing is enabled, queue the command
+        if (queueIfDisconnected && this.connectionState === ConnectionState.Reconnecting) {
+            this.logger.debug(`Queuing command ${requestId} (${request.method}) - reconnecting...`);
+            return new Promise((resolve, reject) => {
+                const result = this.commandQueue.enqueue({
+                    id: requestId,
+                    request: message,
+                    resolve,
+                    reject,
+                    timeout
+                });
+                if (result.success) {
+                    this.logger.info(`Command ${requestId} queued at position ${result.position}`);
+                }
+                // If queuing failed, the command was already rejected by the queue
+            });
+        }
+        // If connecting and queuing is enabled, queue the command
+        if (queueIfDisconnected && this.connectionState === ConnectionState.Connecting) {
+            this.logger.debug(`Queuing command ${requestId} (${request.method}) - connecting...`);
+            return new Promise((resolve, reject) => {
+                const result = this.commandQueue.enqueue({
+                    id: requestId,
+                    request: message,
+                    resolve,
+                    reject,
+                    timeout
+                });
+                if (result.success) {
+                    this.logger.info(`Command ${requestId} queued at position ${result.position}`);
+                }
+            });
+        }
+        // Not connected - try to connect first
+        this.logger.info('Not connected to Unity, connecting first...');
+        try {
+            await this.connection.connect();
+            // Connection successful, send the request
+            return this.sendRequestInternal(message, timeout);
+        }
+        catch (error) {
+            // Connection failed - if queuing is enabled, queue the command
+            if (queueIfDisconnected) {
+                this.logger.debug(`Queuing command ${requestId} (${request.method}) - connection failed, will retry`);
+                return new Promise((resolve, reject) => {
+                    const result = this.commandQueue.enqueue({
+                        id: requestId,
+                        request: message,
+                        resolve,
+                        reject,
+                        timeout
+                    });
+                    if (result.success) {
+                        this.logger.info(`Command ${requestId} queued at position ${result.position}, waiting for reconnection`);
+                    }
+                });
+            }
+            throw new McpUnityError(ErrorType.CONNECTION, `Not connected to Unity: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+    /**
+     * Internal method to send a request directly to Unity
+     * Bypasses queuing logic - assumes connection is already established
+     */
+    sendRequestInternal(request, customTimeout) {
+        const requestId = request.id;
+        const timeoutMs = customTimeout ?? this.requestTimeout;
+        return new Promise((resolve, reject) => {
+            if (!this.connection || !this.isConnected) {
+                reject(new McpUnityError(ErrorType.CONNECTION, 'Not connected to Unity'));
+                return;
+            }
+            // Create timeout for the request
+            const timeout = setTimeout(() => {
+                if (this.pendingRequests.has(requestId)) {
+                    this.logger.error(`Request ${requestId} timed out after ${timeoutMs}ms`);
+                    this.pendingRequests.delete(requestId);
+                    reject(new McpUnityError(ErrorType.TIMEOUT, 'Request timed out'));
+                }
+            }, timeoutMs);
+            // Store pending request
+            const pendingBeforeSend = this.pendingRequests.size;
+            this.pendingRequests.set(requestId, {
+                resolve,
+                reject,
+                timeout,
+                request
+            });
+            try {
+                this.logger.info(`Sending Unity request ${requestId} (${request.method}) while connection state is ${this.connectionState}; pending requests before send: ${pendingBeforeSend}`);
+                this.connection.send(JSON.stringify(request));
+                this.logger.debug(`Request sent: ${requestId}`);
+            }
+            catch (err) {
+                clearTimeout(timeout);
+                this.pendingRequests.delete(requestId);
+                reject(new McpUnityError(ErrorType.CONNECTION, `Send failed: ${err instanceof Error ? err.message : String(err)}`));
+            }
+        });
+    }
+    /**
+     * Check if connected to Unity
+     * Only returns true if the connection is guaranteed to be active
+     */
+    get isConnected() {
+        return this.connection !== null && this.connection.isConnected;
+    }
+    /**
+     * Get current connection state
+     */
+    get connectionState() {
+        return this.connection?.connectionState ?? ConnectionState.Disconnected;
+    }
+    /**
+     * Check if currently connecting or reconnecting
+     */
+    get isConnecting() {
+        return this.connection?.isConnecting ?? false;
+    }
+    /**
+     * Add a listener for connection state changes
+     * @param callback Function to call when connection state changes
+     * @returns Function to remove the listener
+     */
+    onConnectionStateChange(callback) {
+        this.stateListeners.add(callback);
+        return () => {
+            this.stateListeners.delete(callback);
+        };
+    }
+    /**
+     * Force a reconnection to Unity
+     * Useful when Unity has reloaded and the connection may be stale
+     */
+    forceReconnect() {
+        if (this.connection) {
+            this.connection.forceReconnect();
+        }
+        else {
+            this.logger.warn('Cannot force reconnect - not started');
+        }
+    }
+    /**
+     * Get connection statistics
+     */
+    getConnectionStats() {
+        const stats = this.connection?.getStats();
+        return {
+            state: stats?.state ?? ConnectionState.Disconnected,
+            pendingRequests: this.pendingRequests.size,
+            reconnectAttempt: stats?.reconnectAttempt,
+            timeSinceLastPong: stats?.timeSinceLastPong
+        };
+    }
+}
