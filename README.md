@@ -26,7 +26,7 @@ The guides are written in Italian.
 
 ## MCP tooling
 
-- `mcp-unity-server/` and `mcp-pipeline/`: local MCP servers (Node and Python).
+- `mcp-unity-server/` and `mcp-pipeline/`: local MCP servers (Node and Python). See also [mcp-unity](https://github.com/pakkio/mcp-unity) and [mcp-cck](https://github.com/pakkio/mcp-cck).
 - `opencode.json`: registers `mcp-blender` and `mcp-unity` for opencode. Its paths are Windows paths for one machine; edit them.
 - `SETUP.md`: exact Python 3.12.10 / Node 24.18.0 install steps on Windows 11, and how to rebuild `.venv` and `node_modules`, which are gitignored.
 - `skills/unity-python-bridge-patterns.md`: patterns for the Unity-Python bridge.
